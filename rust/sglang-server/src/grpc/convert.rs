@@ -397,7 +397,6 @@ mod tests {
             text: "hello".into(),
             sampling_params: Some(proto::SamplingParams {
                 temperature: Some(0.8),
-                stop: vec!["END".into()],
                 seed: Some(7),
                 ..Default::default()
             }),

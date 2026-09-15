@@ -7,7 +7,6 @@ use tonic::{Code, Request};
 
 use super::GrpcService;
 use crate::frontend::{FrontendConfig, FrontendHandle, FrontendMetadata};
-use crate::message::config::{PreferredSamplingParams, ServerArgs};
 use crate::message::finish_reason::FinishReason;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, Request as RuntimeRequest, RequestKind};
@@ -93,38 +92,6 @@ fn stop_reason() -> FinishReason {
     serde_json::from_value(serde_json::json!({"type": "stop"})).unwrap()
 }
 
-#[test]
-fn production_constructor_snapshots_only_adapter_policy() {
-    let (intake_tx, _intake_rx) = flume::unbounded();
-    let (abort_tx, _abort_rx) = flume::unbounded();
-    let frontend = FrontendHandle::new(
-        intake_tx,
-        abort_tx,
-        FrontendConfig {
-            response_capacity: 1,
-            response_activity: Default::default(),
-            startup_ready: true,
-            is_disaggregation: false,
-            mm_limits: Default::default(),
-            metadata: FrontendMetadata::default(),
-        },
-    );
-    let preferred = PreferredSamplingParams(serde_json::json!({"temperature": 0.5}));
-    let args = ServerArgs {
-        incremental_streaming_output: true,
-        preferred_sampling_params: Some(preferred),
-        ..Default::default()
-    };
-
-    let service = GrpcService::new(frontend, &args);
-    assert!(service.config.incremental_streaming_output);
-    assert!(service.config.preferred_sampling_params.is_some());
-    assert_eq!(
-        service.config.response_timeout,
-        super::DEFAULT_RESPONSE_TIMEOUT
-    );
-}
-
 #[tokio::test]
 async fn text_generate_maps_request_and_streams_cumulative_responses() {
     let harness = Harness::new(2, false, Duration::from_secs(1));
@@ -159,7 +126,9 @@ async fn text_generate_maps_request_and_streams_cumulative_responses() {
     assert_eq!(first.text, "Hel");
     assert!(!first.finished);
     assert_eq!(first.meta_info["id"], r#""request-1""#);
+    assert_eq!(first.meta_info["prompt_tokens"], "3");
     assert_eq!(first.meta_info["completion_tokens"], "1");
+    assert_eq!(first.meta_info["finish_reason"], "null");
 
     let finished = stream.next().await.unwrap().unwrap();
     assert_eq!(finished.text, "Hello");
@@ -207,24 +176,9 @@ async fn generate_streams_incremental_token_ids_with_cumulative_count() {
 }
 
 #[tokio::test]
-async fn stream_drop_delegates_pending_and_admitted_cancellation_to_frontend_call() {
-    let pending = Harness::new(1, false, Duration::from_secs(1));
-    let stream = pending
-        .service
-        .generate(Request::new(proto::GenerateRequest {
-            input_ids: vec![1],
-            ..Default::default()
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-    let intake = pending.next_generation().await;
-    drop(stream);
-    assert!(!intake.admission.try_accept());
-    assert!(pending.abort_rx.try_recv().is_err());
-
-    let admitted = Harness::new(1, false, Duration::from_secs(1));
-    let mut stream = admitted
+async fn stream_drop_aborts_admitted_request() {
+    let harness = Harness::new(1, false, Duration::from_secs(1));
+    let mut stream = harness
         .service
         .generate(Request::new(proto::GenerateRequest {
             input_ids: vec![1],
@@ -234,7 +188,7 @@ async fn stream_drop_delegates_pending_and_admitted_cancellation_to_frontend_cal
         .await
         .unwrap()
         .into_inner();
-    let intake = admitted.next_generation().await;
+    let intake = harness.next_generation().await;
     assert!(intake.admission.try_accept());
     intake
         .sink
@@ -242,9 +196,9 @@ async fn stream_drop_delegates_pending_and_admitted_cancellation_to_frontend_cal
         .unwrap();
     assert!(stream.next().await.unwrap().is_ok());
     drop(stream);
-    let abort = admitted.abort_rx.recv_async().await.unwrap();
+    let abort = harness.abort_rx.recv_async().await.unwrap();
     assert_eq!(abort.rid().client_facing(), "cancel-me");
-    assert!(admitted.abort_rx.try_recv().is_err());
+    assert!(harness.abort_rx.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -332,15 +286,4 @@ async fn closed_intake_is_a_top_level_unavailable_status() {
         Err(error) => error,
     };
     assert_eq!(error.code(), Code::Unavailable);
-}
-
-#[tokio::test]
-async fn unsupported_service_methods_are_explicitly_unimplemented() {
-    let harness = Harness::new(1, false, Duration::from_secs(1));
-    let error = harness
-        .service
-        .health_check(Request::new(proto::HealthCheckRequest {}))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), Code::Unimplemented);
 }

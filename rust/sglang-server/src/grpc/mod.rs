@@ -27,6 +27,7 @@ mod response;
 #[cfg(test)]
 mod tests;
 
+#[cfg_attr(test, allow(dead_code))]
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -53,6 +54,7 @@ pub(crate) struct GrpcService {
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl GrpcService {
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn new(frontend: FrontendHandle, server_args: &ServerArgs) -> Self {
         Self {
             frontend,

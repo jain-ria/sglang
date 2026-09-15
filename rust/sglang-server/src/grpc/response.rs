@@ -179,18 +179,4 @@ mod tests {
             assert_eq!(status(error).code(), expected);
         }
     }
-
-    #[test]
-    fn metadata_values_are_individually_json_encoded() {
-        let output = FrontendOutput {
-            prompt_tokens: 3,
-            completion_tokens: 1,
-            ..Default::default()
-        };
-        let meta = grpc_meta_info(&output, "request-1");
-        assert_eq!(meta["id"], r#""request-1""#);
-        assert_eq!(meta["prompt_tokens"], "3");
-        assert_eq!(meta["completion_tokens"], "1");
-        assert_eq!(meta["finish_reason"], "null");
-    }
 }
