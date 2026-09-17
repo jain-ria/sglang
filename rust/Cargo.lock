@@ -3722,6 +3722,7 @@ dependencies = [
  "flume",
  "futures",
  "hf-hub",
+ "http",
  "itertools",
  "libc",
  "minijinja",
