@@ -23,15 +23,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import grpc
+import httpx
+import openai
 import psutil
 import requests
-from _rust_frontend_e2e_client import (
-    PROMPT,
-    grpc_frames,
-    http_frames,
-    make_body,
-    summarize,
-)
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -44,13 +39,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+PROMPT = "Write a short sentence about the ocean."
 APIS = ("text", "tokens", "completion", "chat")
-PATHS = dict(
-    text="/generate",
-    tokens="/generate",
-    completion="/v1/completions",
-    chat="/v1/chat/completions",
-)
 
 
 def wait_for(predicate, description, timeout=15):
@@ -60,6 +50,137 @@ def wait_for(predicate, description, timeout=15):
             return
         time.sleep(0.1)
     raise AssertionError(f"Timed out: {description}")
+
+
+def _payload(raw):
+    value = json.loads(raw)
+    assert isinstance(value, dict), f"expected JSON object: {value!r}"
+    assert "error" not in value, f"server error: {value!r}"
+    return value
+
+
+def grpc_frames(call, api, stream):
+    """Read synchronous runtime.v1 response iterators, including stream=false."""
+    assert api in ("text", "tokens", "completion", "chat"), api
+    native = api in ("text", "tokens")
+    finished = False
+    count = 0
+    for chunk in call:
+        assert not finished, "gRPC response after terminal marker"
+        count += 1
+        finished = chunk.finished
+        if native:
+            if not stream:
+                assert finished and count == 1, (
+                    "nonstream native must have one response"
+                )
+            value = {
+                "meta_info": {
+                    key: json.loads(raw) for key, raw in chunk.meta_info.items()
+                }
+            }
+            value["text" if api == "text" else "output_ids"] = (
+                chunk.text if api == "text" else list(chunk.output_ids)
+            )
+            assert bool(value["meta_info"].get("finish_reason")) == finished
+            yield value
+        elif stream:
+            if finished:
+                assert not chunk.json_chunk, "stream terminal must be empty"
+            else:
+                assert chunk.json_chunk, "empty nonterminal OpenAI chunk"
+                yield _payload(chunk.json_chunk)
+        else:
+            assert finished and count == 1, (
+                "nonstream OpenAI must have one terminal JSON chunk"
+            )
+            yield _payload(chunk.json_chunk)
+    assert finished, "gRPC response truncated before terminal marker"
+
+
+def _usage(value):
+    assert isinstance(value, dict), f"missing usage: {value!r}"
+    result = {
+        key: value[key]
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+    }
+    assert all(type(count) is int and count > 0 for count in result.values()), result
+    assert (
+        result["total_tokens"] == result["prompt_tokens"] + result["completion_tokens"]
+    ), result
+    return result
+
+
+def summarize(api, frames, stream):
+    """Return transport-stable output, finish_reason and usage for one request.
+
+    Native output is text or token IDs; OpenAI output and finish_reason are
+    lists ordered by choice index. Native streams must use cumulative output.
+    """
+    assert api in ("text", "tokens", "completion", "chat"), api
+    frames = list(frames)
+    assert frames, "no JSON response frames"
+    if api in ("text", "tokens"):
+        final = frames[-1]
+        meta = final["meta_info"]
+        finish = meta.get("finish_reason")
+        assert isinstance(finish, dict) and finish.get("type") in ("stop", "length"), (
+            finish
+        )
+        assert all(not frame["meta_info"].get("finish_reason") for frame in frames[:-1])
+        counts = [frame["meta_info"]["completion_tokens"] for frame in frames]
+        assert counts == sorted(counts), counts
+        output = final["text" if api == "text" else "output_ids"]
+        assert output, "empty native output"
+        usage = _usage(
+            {
+                "prompt_tokens": meta["prompt_tokens"],
+                "completion_tokens": meta["completion_tokens"],
+                "total_tokens": meta["prompt_tokens"] + meta["completion_tokens"],
+            }
+        )
+        return {"output": output, "finish_reason": finish, "usage": usage}
+
+    outputs, finishes = {}, {}
+    usage = None
+    for frame in frames:
+        assert "error" not in frame, frame
+        choices = frame["choices"]
+        if frame.get("usage") is not None:
+            assert usage is None, "multiple final usage records"
+            usage = _usage(frame["usage"])
+            if stream:
+                assert choices == [], "expected final aggregate usage chunk"
+        else:
+            assert usage is None, "data after final usage"
+        for choice in choices:
+            index = choice["index"]
+            assert type(index) is int and index >= 0, index
+            assert index not in finishes, "choice data after finish"
+            if api == "chat":
+                text = choice["delta" if stream else "message"].get("content") or ""
+            else:
+                text = choice["text"]
+            assert isinstance(text, str), text
+            outputs[index] = outputs.get(index, "") + text
+            reason = choice.get("finish_reason")
+            if reason is not None:
+                assert reason in ("stop", "length"), reason
+                finishes[index] = reason
+    indexes = sorted(outputs)
+    assert indexes == list(range(len(indexes))) and indexes, indexes
+    assert all(outputs[index] and index in finishes for index in indexes), (
+        outputs,
+        finishes,
+    )
+    assert usage is not None, "missing aggregate usage"
+    if not stream:
+        assert len(frames) == 1, "nonstream OpenAI returned multiple payloads"
+    return {
+        "output": [outputs[index] for index in indexes],
+        "finish_reason": [finishes[index] for index in indexes],
+        "usage": usage,
+    }
 
 
 class TestRustFrontendE2E(CustomTestCase):
@@ -102,6 +223,13 @@ class TestRustFrontendE2E(CustomTestCase):
         cls.addClassCleanup(sys.path.remove, str(generated))
         cls.pb = importlib.import_module("sglang_pb2")
         cls.stub_type = importlib.import_module("sglang_pb2_grpc").SglangServiceStub
+        cls.client = openai.OpenAI(
+            api_key="EMPTY",
+            base_url=f"{cls.base_url}/v1",
+            timeout=httpx.Timeout(30, connect=5),
+            max_retries=0,
+        )
+        cls.addClassCleanup(cls.client.close)
         cls.launch()
 
     @classmethod
@@ -176,12 +304,36 @@ class TestRustFrontendE2E(CustomTestCase):
                 print(cls.logs())
 
     def body(self, api, stream):
-        return make_body(api, stream, "e2e-model", self.tokens)
+        if api in ("text", "tokens"):
+            return {
+                "text" if api == "text" else "input_ids": (
+                    PROMPT if api == "text" else self.tokens
+                ),
+                "stream": stream,
+                "sampling_params": {"temperature": 0, "max_new_tokens": 16},
+            }
+        body = {
+            "model": "e2e-model",
+            "stream": stream,
+            "temperature": 0,
+            "max_tokens": 16,
+        }
+        if api == "chat":
+            body["messages"] = [{"role": "user", "content": PROMPT}]
+        else:
+            body["prompt"] = PROMPT
+        if stream:
+            body["stream_options"] = {"include_usage": True}
+        return body
 
     def open_call(self, api, body, transport):
         if transport == "http":
+            if api == "chat":
+                return self.client.chat.completions.create(**body)
+            if api == "completion":
+                return self.client.completions.create(**body)
             return requests.post(
-                self.base_url + PATHS[api],
+                self.base_url + "/generate",
                 json=body,
                 stream=body["stream"],
                 timeout=(5, 30),
@@ -202,11 +354,31 @@ class TestRustFrontendE2E(CustomTestCase):
         )
 
     def frames(self, call, api, stream, transport):
-        return (
-            http_frames(call, stream)
-            if transport == "http"
-            else grpc_frames(call, api, stream)
-        )
+        if transport == "grpc":
+            yield from grpc_frames(call, api, stream)
+        elif api in ("completion", "chat"):
+            # The OpenAI SDK handles HTTP/SSE; use JSON dictionaries for parity.
+            for response in call if stream else [call]:
+                yield response.model_dump(exclude_none=True)
+        else:
+            call.raise_for_status()
+            content_type = call.headers.get("content-type", "").split(";", 1)[0].strip()
+            if not stream:
+                assert content_type == "application/json", content_type
+                yield _payload(call.content)
+                return
+            assert content_type == "text/event-stream", content_type
+            # Match the native /generate tests' line-based SSE reader.
+            finished = False
+            for line in call.iter_lines():
+                if line.startswith(b"data:"):
+                    assert not finished, "SSE data after [DONE]"
+                    data = line[5:].strip()
+                    if data == b"[DONE]":
+                        finished = True
+                    else:
+                        yield _payload(data)
+            assert finished, "SSE response truncated before [DONE]"
 
     def generate(self, api, stream, transport="http", body=None):
         call = self.open_call(api, body or self.body(api, stream), transport)
@@ -214,7 +386,10 @@ class TestRustFrontendE2E(CustomTestCase):
             frames = list(self.frames(call, api, stream, transport))
             return summarize(api, frames, stream)
         finally:
-            call.close() if transport == "http" else call.cancel()
+            if transport == "grpc":
+                call.cancel()
+            elif api in ("text", "tokens") or stream:
+                call.close()
 
     def test_generation(self):
         for api in APIS:
