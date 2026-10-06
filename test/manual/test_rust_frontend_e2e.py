@@ -28,7 +28,6 @@ import openai
 import psutil
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -37,6 +36,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     find_available_port,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 PROMPT = "Write a short sentence about the ocean."
@@ -293,7 +293,7 @@ class TestRustFrontendE2E(CustomTestCase):
             if cls.channel is not None:
                 cls.channel.close()
             if cls.process is not None and cls.process.poll() is None:
-                kill_process_tree(cls.process.pid)
+                terminate_and_kill_process_tree(cls.process)
             # The launcher may have exited without cleaning up its children.
             for child in cls.owned_children:
                 if child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
