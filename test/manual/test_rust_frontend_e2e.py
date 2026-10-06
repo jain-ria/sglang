@@ -1,20 +1,28 @@
-"""Opt-in, real-model validation; see rust_frontend_e2e.md for the three runs."""
+"""Manual E2E tests for the Rust frontend's HTTP and runtime.v1 gRPC listeners.
+
+Run from a SGLang source checkout with one GPU, the Rust server extension,
+and grpcio-tools installed in the same environment as the sglang command:
+
+    python3 test/manual/test_rust_frontend_e2e.py -v
+
+Uses the standard small test model. No CI registration or baseline checkout
+is required; generated bindings and server logs use a temporary directory.
+"""
 
 import importlib
-import importlib.metadata
 import json
-import os
 import re
-import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import grpc
 import psutil
 import requests
 from _rust_frontend_e2e_client import (
@@ -25,13 +33,14 @@ from _rust_frontend_e2e_client import (
     summarize,
 )
 
-import sglang
-from sglang.srt.rust_extensions import load_rust_extension
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    find_available_port,
     popen_launch_server,
 )
 
@@ -53,103 +62,46 @@ def wait_for(predicate, description, timeout=15):
     raise AssertionError(f"Timed out: {description}")
 
 
-def stable(value):
-    """Strip only generated IDs/timing, not output, usage, errors or finish reasons."""
-    if isinstance(value, dict):
-        return {
-            k: stable(v)
-            for k, v in value.items()
-            if k not in ("id", "created", "e2e_latency")
-        }
-    if isinstance(value, list):
-        return [stable(v) for v in value]
-    return value
-
-
 class TestRustFrontendE2E(CustomTestCase):
     process = None
     owned_children = []
     channel = None
     server_log = None
-    tests_succeeded = False
+    model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+    base_url = DEFAULT_URL_FOR_TEST
 
     @classmethod
     def setUpClass(cls):
         if not __debug__:
             raise RuntimeError("Do not run this suite with Python -O")
-        os.environ["SGLANG_TEST_MAX_RETRY"] = "0"
-        cls.output = Path(os.environ["SGLANG_E2E_OUTPUT_DIR"]).resolve()
-        cls.output.mkdir(parents=True, exist_ok=False)
-        cls.model = str(Path(os.environ["SGLANG_E2E_MODEL_PATH"]).resolve(strict=True))
-        cls.dual = os.environ.get("SGLANG_E2E_HTTP_ONLY") != "1"
-        cls.base_url = (
-            f"http://127.0.0.1:{int(os.environ.get('SGLANG_E2E_HTTP_PORT', '30000'))}"
-        )
-        cls.grpc_port = int(os.environ.get("SGLANG_E2E_GRPC_PORT", "50051"))
-        cls.source = Path(sglang.__file__).resolve().parents[2]
-        assert (cls.source / "rust/Cargo.toml").is_file(), (
-            "Import SGLang from the source checkout"
-        )
-        launcher = Path(shutil.which("sglang") or "missing-sglang-command")
-        interpreter = launcher.read_text().splitlines()[0].removeprefix("#!")
-        assert Path(interpreter).absolute() == Path(sys.executable).absolute(), (
-            "Run this test with the interpreter named by the sglang executable"
-        )
-        extension = load_rust_extension(
-            "sglang.srt.rust_extensions._server", mode="auto"
-        )
+        cls.source = Path(__file__).resolve().parents[2]
+        temporary = tempfile.TemporaryDirectory(prefix="rust-frontend-e2e-")
+        cls.addClassCleanup(temporary.cleanup)
+        cls.output = Path(temporary.name)
+        cls.grpc_port = find_available_port(int(cls.base_url.rsplit(":", 1)[1]) + 1)
         cls.tokenizer = get_tokenizer(cls.model)
         cls.tokens = cls.tokenizer.encode(PROMPT)
-        revision = (
-            os.environ.get("SGLANG_E2E_SOURCE_REVISION")
-            or subprocess.check_output(
-                ["git", "-C", str(cls.source), "rev-parse", "HEAD"], text=True
-            ).strip()
-        )
-        cls.report = {
-            "source_revision": revision,
-            "source": str(cls.source),
-            "extension": extension.__file__,
-            "model": cls.model,
-            "dual_protocol": cls.dual,
-            "packages": {
-                name: importlib.metadata.version(name)
-                for name in ("torch", "transformers", "sglang-kernel", "grpcio")
-            },
-            "gpu": subprocess.check_output(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=name,driver_version",
-                    "--format=csv,noheader",
-                ],
-                text=True,
-            ).strip(),
-            "http": {},
-            "completed_tests": [],
-            "passed": False,
-        }
-        if cls.dual:
-            import grpc
 
-            cls.grpc = grpc
-            generated = cls.output / "client"
-            generated.mkdir()
-            proto = cls.source / "proto/sglang/runtime/v1"
-            subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "grpc_tools.protoc",
-                    f"-I{proto}",
-                    f"--python_out={generated}",
-                    f"--grpc_python_out={generated}",
-                    str(proto / "sglang.proto"),
-                ],
-                check=True,
-            )
-            sys.path.insert(0, str(generated))
-            cls.pb = importlib.import_module("sglang_pb2")
-            cls.stub_type = importlib.import_module("sglang_pb2_grpc").SglangServiceStub
+        # Generate the client from this checkout's canonical service definition.
+        generated = cls.output / "client"
+        generated.mkdir()
+        proto = cls.source / "proto/sglang/runtime/v1"
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "grpc_tools.protoc",
+                f"-I{proto}",
+                f"--python_out={generated}",
+                f"--grpc_python_out={generated}",
+                str(proto / "sglang.proto"),
+            ],
+            check=True,
+        )
+        sys.path.insert(0, str(generated))
+        cls.addClassCleanup(sys.path.remove, str(generated))
+        cls.pb = importlib.import_module("sglang_pb2")
+        cls.stub_type = importlib.import_module("sglang_pb2_grpc").SglangServiceStub
         cls.launch()
 
     @classmethod
@@ -172,10 +124,9 @@ class TestRustFrontendE2E(CustomTestCase):
             "--disable-radix-cache",
             "--log-level",
             "debug",
+            "--grpc-port",
+            str(cls.grpc_port),
         ]
-        if cls.dual:
-            args += ["--grpc-port", str(cls.grpc_port)]
-        cls.report["server_args"] = args
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -184,7 +135,6 @@ class TestRustFrontendE2E(CustomTestCase):
             return_stdout_stderr=(cls.server_log, cls.server_log),
             env={
                 "SGLANG_RUST_SERVER": "1",
-                "SGLANG_RUST_BUILD_MODE": "auto",
                 "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "0",
                 "PYTHONPATH": str(cls.source / "python"),
             },
@@ -198,13 +148,12 @@ class TestRustFrontendE2E(CustomTestCase):
         assert "SGLANG_RUST_SERVER enabled" in cls.logs()[offset:], (
             "Not the Rust frontend"
         )
-        if cls.dual:
-            assert "gRPC server listening" in cls.logs()[offset:], (
-                "Not the Rust Tonic listener"
-            )
-            cls.channel = cls.grpc.insecure_channel(f"127.0.0.1:{cls.grpc_port}")
-            cls.grpc.channel_ready_future(cls.channel).result(timeout=15)
-            cls.stub = cls.stub_type(cls.channel)
+        assert "gRPC server listening" in cls.logs()[offset:], (
+            "Not the Rust Tonic listener"
+        )
+        cls.channel = grpc.insecure_channel(f"127.0.0.1:{cls.grpc_port}")
+        grpc.channel_ready_future(cls.channel).result(timeout=15)
+        cls.stub = cls.stub_type(cls.channel)
 
     @classmethod
     def logs(cls):
@@ -212,7 +161,6 @@ class TestRustFrontendE2E(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cleaned_up = False
         try:
             if cls.channel is not None:
                 cls.channel.close()
@@ -222,22 +170,10 @@ class TestRustFrontendE2E(CustomTestCase):
             for child in cls.owned_children:
                 if child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
                     child.kill()
+        finally:
             if cls.server_log is not None:
                 cls.server_log.close()
-            cleaned_up = True
-        finally:
-            if hasattr(cls, "report"):
-                cls.report["passed"] = cleaned_up and cls.tests_succeeded
-                (cls.output / "report.json").write_text(
-                    json.dumps(cls.report, indent=2) + "\n"
-                )
-
-    def tearDown(self):
-        self.report["completed_tests"].append(self._testMethodName)
-        type(self).tests_succeeded = (
-            self._outcome.result.wasSuccessful()
-            and len(self.report["completed_tests"]) == 6
-        )
+                print(cls.logs())
 
     def body(self, api, stream):
         return make_body(api, stream, "e2e-model", self.tokens)
@@ -276,53 +212,24 @@ class TestRustFrontendE2E(CustomTestCase):
         call = self.open_call(api, body or self.body(api, stream), transport)
         try:
             frames = list(self.frames(call, api, stream, transport))
-            return summarize(api, frames, stream), frames
+            return summarize(api, frames, stream)
         finally:
             call.close() if transport == "http" else call.cancel()
 
-    def test_01_generation_matrix_and_http_baseline(self):
+    def test_generation(self):
         for api in APIS:
             expected = None
             for stream in (False, True):
                 with self.subTest(api=api, stream=stream):
-                    summary, frames = self.generate(api, stream)
-                    self.report["http"][f"{api}/{stream}"] = (
-                        summary if stream else stable(frames[0])
-                    )
+                    summary = self.generate(api, stream)
                     if expected is None:
                         expected = summary
                     self.assertEqual(
                         summary, expected, "HTTP stream/nonstream mismatch"
                     )
-                    if self.dual:
-                        self.assertEqual(self.generate(api, stream, "grpc")[0], summary)
-        # Keep a malformed request in the before/after HTTP comparison too.
-        with requests.post(
-            self.base_url + "/v1/completions",
-            json={"model": "e2e-model", "prompt": PROMPT, "n": 0},
-            timeout=30,
-        ) as response:
-            self.assertEqual(response.status_code, 400)
-            self.report["http"]["invalid"] = response.json()
-        reference = os.environ.get("SGLANG_E2E_REFERENCE")
-        if reference:
-            baseline = json.loads(Path(reference).read_text())
-            self.assertTrue(baseline["passed"], "Reference run did not pass")
-            self.assertEqual(baseline["model"], self.model)
-            self.assertEqual(baseline["packages"], self.report["packages"])
-            self.assertEqual(baseline["gpu"], self.report["gpu"])
-            self.assertEqual(
-                baseline["server_args"][:-2]
-                if baseline["dual_protocol"]
-                else baseline["server_args"],
-                self.report["server_args"][:-2]
-                if self.dual
-                else self.report["server_args"],
-            )
-            self.assertEqual(baseline["http"], self.report["http"])
-            self.report["reference"] = reference
+                    self.assertEqual(self.generate(api, stream, "grpc"), summary)
 
-    def test_02_metadata_and_health(self):
+    def test_metadata_and_health(self):
         for path in ("/health", "/health_generate"):
             self.assertEqual(
                 requests.get(self.base_url + path, timeout=30).status_code, 200
@@ -333,61 +240,61 @@ class TestRustFrontendE2E(CustomTestCase):
             with requests.get(self.base_url + "/server_info", timeout=30) as response:
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(response.json()["max_context_length"], 4096)
-        if self.dual:
-            self.assertTrue(
-                self.stub.HealthCheck(self.pb.HealthCheckRequest(), timeout=30).healthy
+        self.assertTrue(
+            self.stub.HealthCheck(self.pb.HealthCheckRequest(), timeout=30).healthy
+        )
+        self.assertEqual(
+            json.loads(
+                self.stub.GetModelInfo(
+                    self.pb.GetModelInfoRequest(), timeout=30
+                ).json_info
+            ),
+            info,
+        )
+        models = self.stub.ListModels(self.pb.ListModelsRequest(), timeout=30).models
+        self.assertEqual(
+            [(m.id, m.max_model_len) for m in models], [("e2e-model", 4096)]
+        )
+        with self.subTest(operation="grpc/GetServerInfo"):
+            server = json.loads(
+                self.stub.GetServerInfo(
+                    self.pb.GetServerInfoRequest(), timeout=30
+                ).json_info
             )
-            self.assertEqual(
-                json.loads(
-                    self.stub.GetModelInfo(
-                        self.pb.GetModelInfoRequest(), timeout=30
-                    ).json_info
-                ),
-                info,
-            )
-            models = self.stub.ListModels(
-                self.pb.ListModelsRequest(), timeout=30
-            ).models
-            self.assertEqual(
-                [(m.id, m.max_model_len) for m in models], [("e2e-model", 4096)]
-            )
-            with self.subTest(operation="grpc/GetServerInfo"):
-                server = json.loads(
-                    self.stub.GetServerInfo(
-                        self.pb.GetServerInfoRequest(), timeout=30
-                    ).json_info
-                )
-                self.assertEqual(server["max_context_length"], 4096)
-            decoded = self.stub.Detokenize(
-                self.pb.DetokenizeRequest(tokens=self.tokens), timeout=30
-            ).text
-            self.assertEqual(
-                decoded, self.tokenizer.decode(self.tokens, skip_special_tokens=True)
-            )
+            self.assertEqual(server["max_context_length"], 4096)
+        decoded = self.stub.Detokenize(
+            self.pb.DetokenizeRequest(tokens=self.tokens), timeout=30
+        ).text
+        self.assertEqual(
+            decoded, self.tokenizer.decode(self.tokens, skip_special_tokens=True)
+        )
 
-    def test_03_rejections(self):
-        if self.dual:
-            with self.assertRaises(self.grpc.RpcError) as caught:
-                self.stub.Tokenize(self.pb.TokenizeRequest(text=PROMPT), timeout=30)
-            self.assertEqual(
-                caught.exception.code(), self.grpc.StatusCode.UNIMPLEMENTED
-            )
-            for option, code in [
-                ({"suffix": "!"}, self.grpc.StatusCode.UNIMPLEMENTED),
-                ({"n": 0}, self.grpc.StatusCode.INVALID_ARGUMENT),
-            ]:
-                with self.assertRaises(self.grpc.RpcError) as caught:
-                    list(
-                        self.open_call(
-                            "completion",
-                            self.body("completion", False) | option,
-                            "grpc",
-                        )
+    def test_rejections(self):
+        with requests.post(
+            self.base_url + "/v1/completions",
+            json=self.body("completion", False) | {"n": 0},
+            timeout=30,
+        ) as response:
+            self.assertEqual(response.status_code, 400)
+        with self.assertRaises(grpc.RpcError) as caught:
+            self.stub.Tokenize(self.pb.TokenizeRequest(text=PROMPT), timeout=30)
+        self.assertEqual(caught.exception.code(), grpc.StatusCode.UNIMPLEMENTED)
+        for option, code in [
+            ({"suffix": "!"}, grpc.StatusCode.UNIMPLEMENTED),
+            ({"n": 0}, grpc.StatusCode.INVALID_ARGUMENT),
+        ]:
+            with self.assertRaises(grpc.RpcError) as caught:
+                list(
+                    self.open_call(
+                        "completion",
+                        self.body("completion", False) | option,
+                        "grpc",
                     )
-                self.assertEqual(caught.exception.code(), code)
+                )
+            self.assertEqual(caught.exception.code(), code)
         self.generate("text", False)
 
-    def test_04_concurrent_clients(self):
+    def test_concurrent_clients(self):
         # Different prompts make cross-delivery observable, not merely two successes.
         first = self.body("text", False)
         second = self.body("completion", False) | {"prompt": "The capital of France is"}
@@ -397,18 +304,17 @@ class TestRustFrontendE2E(CustomTestCase):
             token = self.tokenizer.encode(word, add_special_tokens=False)[-1]
             self.assertNotIn(token, self.tokenizer.all_special_ids)
             params["logit_bias"] = {str(token): 100}
-        transport = "grpc" if self.dual else "http"
         expected = [
-            self.generate("text", False, body=first)[0],
-            self.generate("completion", False, transport, second)[0],
+            self.generate("text", False, body=first),
+            self.generate("completion", False, "grpc", second),
         ]
         self.assertNotEqual(expected[0]["output"], expected[1]["output"][0])
         with ThreadPoolExecutor(max_workers=2) as pool:
             pending = [
                 pool.submit(self.generate, "text", False, "http", first),
-                pool.submit(self.generate, "completion", False, transport, second),
+                pool.submit(self.generate, "completion", False, "grpc", second),
             ]
-            self.assertEqual([f.result(timeout=40)[0] for f in pending], expected)
+            self.assertEqual([f.result(timeout=40) for f in pending], expected)
 
     def assert_cancelled(self, api, body, transport, choices=1):
         offset = len(self.logs())
@@ -456,8 +362,8 @@ class TestRustFrontendE2E(CustomTestCase):
         )
         self.generate("text", False)
 
-    def test_05_cancellation(self):
-        for transport in ("http", "grpc") if self.dual else ("http",):
+    def test_cancellation(self):
+        for transport in ("http", "grpc"):
             body = self.body("text", True)
             body["rid"] = f"cancel-{uuid.uuid4().hex}"
             body["sampling_params"].update(max_new_tokens=2048, ignore_eos=True)
@@ -470,14 +376,13 @@ class TestRustFrontendE2E(CustomTestCase):
                 "logit_bias": {str(token): 100},
             }
             self.assertEqual(
-                self.generate("completion", True, transport, body)[0]["finish_reason"],
+                self.generate("completion", True, transport, body)["finish_reason"],
                 ["length", "length"],
             )
             body["max_tokens"] = 2048
             self.assert_cancelled("completion", body, transport, choices=2)
 
     def stop_and_assert(self):
-        started = time.monotonic()
         self.process.terminate()
         self.process.wait(timeout=30)
         wait_for(
@@ -488,22 +393,15 @@ class TestRustFrontendE2E(CustomTestCase):
             "owned scheduler processes exiting",
             timeout=15,
         )
-        for port in (
-            [int(self.base_url.rsplit(":", 1)[1]), self.grpc_port]
-            if self.dual
-            else [int(self.base_url.rsplit(":", 1)[1])]
-        ):
+        for port in (int(self.base_url.rsplit(":", 1)[1]), self.grpc_port):
             with socket.socket() as probe:
                 probe.settimeout(1)
                 self.assertNotEqual(probe.connect_ex(("127.0.0.1", port)), 0)
-        self.report.setdefault("shutdown_seconds", []).append(
-            time.monotonic() - started
-        )
 
-    def test_06_shutdown_and_restart(self):
+    def test_shutdown_and_restart(self):
         calls = []
         try:
-            for transport in ("http", "grpc") if self.dual else ("http",):
+            for transport in ("http", "grpc"):
                 body = self.body("text", True)
                 body["sampling_params"].update(max_new_tokens=2048, ignore_eos=True)
                 call = self.open_call("text", body, transport)
@@ -517,20 +415,22 @@ class TestRustFrontendE2E(CustomTestCase):
                     list(call.iter_content() if transport == "http" else call)
                 except (
                     requests.RequestException,
-                    self.grpc.RpcError if self.dual else requests.RequestException,
+                    grpc.RpcError,
                 ):
                     pass  # Bounded cancellation, not a promise to finish generation.
         finally:
             for transport, call, _ in calls:
                 call.close() if transport == "http" else call.cancel()
-        if self.channel is not None:
-            self.channel.close()
+        self.restart_and_check()
+        self.stop_and_assert()  # Also check idle shutdown on the rebound ports.
+        self.restart_and_check()
+
+    def restart_and_check(self):
+        self.channel.close()
         self.server_log.close()
         type(self).launch()
         self.generate("text", False)
-        if self.dual:
-            self.generate("text", False, "grpc")
-        self.stop_and_assert()  # Idle shutdown, after rebinding the same ports.
+        self.generate("text", False, "grpc")
 
 
 if __name__ == "__main__":
